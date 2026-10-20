@@ -1,124 +1,85 @@
-import ast
-import operator
-from datetime import datetime
+import asyncio
+import sys
+from pathlib import Path
 
-import ollama
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from ollama import AsyncClient
 
 MODEL = "llama3.1:8b"
+MAX_STEPS = 5
+
+SERVER = StdioServerParameters(
+    command=sys.executable,  # тот же Python, что запускает агента (из .venv)
+    args=[str(Path(__file__).parent / "mcp_servers" / "tools_server.py")],
+)
 
 
-# ---------- Инструменты: обычные функции Python ----------
-
-def get_current_time() -> str:
-    """Возвращает текущую дату и время."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-# Разрешаем только арифметику. Использовать eval() напрямую нельзя:
-# через него можно выполнить любой вредоносный код.
-OPERATORS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.Pow: operator.pow,
-    ast.USub: operator.neg,
-}
-
-
-def _evaluate(node):
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in OPERATORS:
-        return OPERATORS[type(node.op)](_evaluate(node.left), _evaluate(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in OPERATORS:
-        return OPERATORS[type(node.op)](_evaluate(node.operand))
-    raise ValueError("Недопустимое выражение")
-
-
-def calculate(expression: str) -> str:
-    """Считает арифметическое выражение, например '2 + 2 * 10'."""
-    try:
-        tree = ast.parse(expression, mode="eval")
-        return str(_evaluate(tree.body))
-    except Exception as error:
-        return f"Ошибка: {error}"
-
-
-# ---------- Описание инструментов для модели ----------
-# Модель не видит наш код. Она видит только это описание
-# и по нему решает, какой инструмент вызвать.
-
-TOOLS = [
-    {
+def to_ollama_tool(tool) -> dict:
+    """Переводит описание MCP-инструмента в формат, понятный Ollama."""
+    return {
         "type": "function",
         "function": {
-            "name": "get_current_time",
-            "description": "Возвращает текущую дату и время",
-            "parameters": {"type": "object", "properties": {}},
+            "name": tool.name,
+            "description": tool.description or "",
+            "parameters": tool.inputSchema,
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate",
-            "description": "Считает арифметическое выражение",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "Выражение, например '15 * 7 + 3'",
-                    }
-                },
-                "required": ["expression"],
-            },
-        },
-    },
-]
-
-TOOL_FUNCTIONS = {
-    "get_current_time": get_current_time,
-    "calculate": calculate,
-}
+    }
 
 
-# ---------- Агентный цикл ----------
-
-def run_agent(user_message: str, messages: list) -> str:
+async def run_agent(user_message, messages, session, tools, client) -> str:
     messages.append({"role": "user", "content": user_message})
 
-    for _ in range(5):  # защита от бесконечного цикла
-        response = ollama.chat(model=MODEL, messages=messages, tools=TOOLS)
+    for _ in range(MAX_STEPS):
+        response = await client.chat(model=MODEL, messages=messages, tools=tools)
         message = response.message
         messages.append(message)
 
-        # Если модель не просит инструмент, значит, ответ готов
         if not message.tool_calls:
             return message.content
 
-        # Иначе выполняем каждый запрошенный инструмент
         for call in message.tool_calls:
             name = call.function.name
-            args = call.function.arguments
+            args = dict(call.function.arguments)
             print(f"  [инструмент] {name}({args})")
 
-            result = TOOL_FUNCTIONS[name](**args)
-            messages.append({"role": "tool", "tool_name": name, "content": result})
+            result = await session.call_tool(name, args)
+            text = "\n".join(c.text for c in result.content if c.type == "text")
+            if result.isError:
+                text = f"Ошибка: {text}"
 
-    return "Агент не смог завершить задачу за 5 шагов."
+            messages.append({"role": "tool", "tool_name": name, "content": text})
+
+    return f"Агент не смог завершить задачу за {MAX_STEPS} шагов."
+
+
+async def main():
+    client = AsyncClient()
+
+    # Запускаем MCP-сервер как отдельный процесс и подключаемся к нему
+    async with stdio_client(SERVER) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            listed = await session.list_tools()
+            tools = [to_ollama_tool(t) for t in listed.tools]
+            print("Инструменты с MCP-сервера:", [t.name for t in listed.tools])
+
+            history = [
+                {
+                    "role": "system",
+                    "content": "Ты полезный ассистент. Используй инструменты, когда нужно. "
+                    "Отвечай по-русски.",
+                }
+            ]
+            print("Агент запущен. Для выхода напишите 'выход'.")
+            while True:
+                question = await asyncio.to_thread(input, "\nВы: ")
+                if question.strip().lower() in ("выход", "exit"):
+                    break
+                answer = await run_agent(question, history, session, tools, client)
+                print("Агент:", answer)
 
 
 if __name__ == "__main__":
-    history = [
-        {
-            "role": "system",
-            "content": "Ты полезный ассистент. Используй инструменты, когда нужно.",
-        }
-    ]
-    print("Агент запущен. Для выхода напишите 'выход'.")
-    while True:
-        question = input("\nВы: ")
-        if question.strip().lower() in ("выход", "exit"):
-            break
-        print("Агент:", run_agent(question, history))
+    asyncio.run(main())
